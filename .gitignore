@@ -1,1 +1,6 @@
 .venv/
+out/*.jpg
+input/*.json
+work/*.txt
+log/*.txt
+log/*.csv

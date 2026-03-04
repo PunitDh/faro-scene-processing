@@ -57,10 +57,99 @@ EXPORT_FOLDER_FIELD_WY := 512
 EXPORT_SELECT_BTN_WX   := 715
 EXPORT_SELECT_BTN_WY   := 550
 
-; WAIT logic
-EXPORT_IDLE_MS := 25000        ; must be QUIET for 5s to consider export finished
-EXPORT_MAX_SEC := 7200        ; 2 hours max safety timeout
+; WAIT logic (existing)
+EXPORT_IDLE_MS := 25000         ; must be QUIET for 25s to consider export finished
+EXPORT_MAX_SEC := 7200          ; 2 hours max safety timeout
 
+; --- NEW: logging / resume ---
+logCsvPath := A_ScriptDir "log\scene_export_log.csv"
+donePath   := A_ScriptDir "log\processed.txt"
+
+; --- NEW: JPG verification (on EXPORT only) ---
+; We only mark processed if jpg count increases by at least batchCount.
+JPG_WAIT_MAX_SEC := 3600        ; 1 hour max wait for jpg growth after export completes
+JPG_IDLE_MS      := 8000        ; if jpg count doesn't change for 8s, we treat as stalled (fail)
+
+; =========================
+
+; ---------- Logging helpers ----------
+NowStamp() {
+    return FormatTime(, "yyyy-MM-dd HH:mm:ss")
+}
+
+CsvEscape(s) {
+    ; CSV rule: double any internal quotes, then wrap whole field in quotes
+    s := StrReplace(s, '"', '""')
+    return '"' s '"'
+}
+
+LogEvent(eventType, batchNum := "-", idx := "-", total := "-", flsPath := "-") {
+    global logCsvPath
+    line := NowStamp() "," CsvEscape(eventType) "," batchNum "," idx "," total "," CsvEscape(flsPath) "`n"
+    FileAppend line, logCsvPath, "UTF-8"
+}
+
+LoadDoneSet(path) {
+    done := Map()
+    if !FileExist(path)
+        return done
+
+    raw := FileRead(path, "UTF-8")
+    raw := StrReplace(raw, "`r", "")
+    lines := StrSplit(raw, "`n")
+    for _, line in lines {
+        p := Trim(line)
+        if (p = "")
+            continue
+        done[p] := true
+    }
+    return done
+}
+
+AppendDoneList(path, flsArray) {
+    out := ""
+    for _, p in flsArray
+        out .= p "`n"
+    FileAppend out, path, "UTF-8"
+}
+
+; ---------- JPG verification helpers (EXPORT only) ----------
+CountJpgs(dir) {
+    c := 0
+    Loop Files dir "\*.jpg", "FR"
+        c++
+    Loop Files dir "\*.jpeg", "FR"
+        c++
+    return c
+}
+
+WaitForJpgGrowth(dir, expectedIncrease, baseCount, maxSec := 3600, idleMs := 8000) {
+    target := baseCount + expectedIncrease
+    start := A_TickCount
+    lastChange := A_TickCount
+    lastCount := baseCount
+
+    Loop {
+        if (A_TickCount - start) > (maxSec * 1000)
+            return false
+
+        cur := CountJpgs(dir)
+        if (cur >= target)
+            return true
+
+        if (cur != lastCount) {
+            lastCount := cur
+            lastChange := A_TickCount
+        } else {
+            if (A_TickCount - lastChange) > idleMs
+                return false
+        }
+        Sleep 500
+    }
+}
+
+; =========================
+; EXISTING WORKING FUNCTIONS (UNCHANGED BEHAVIOR)
 ; =========================
 
 ActivateScene() {
@@ -120,15 +209,14 @@ ImportOneFls(flsPath) {
 
 ; ---------- Optional dialog: Confirm "File already exists" -> pick "No All" ----------
 IsFileExistsDialog() {
-    ; window title is Confirm, but verify its text
     hwnd := WinExist("Confirm")
     if !hwnd
         return false
 
     Loop 10 {
         try txt := ControlGetText("Static" A_Index, "ahk_id " hwnd)
-        catch { 
-          continue
+        catch {
+            continue
         }
         if InStr(txt, "File already exists")
             return true
@@ -150,11 +238,10 @@ HandleFileExistsConfirmOnce() {
 }
 
 IsScanModifiedDialog(hwnd) {
-    ; checks for text fragment in any Static control
     Loop 10 {
         try txt := ControlGetText("Static" A_Index, "ahk_id " hwnd)
         catch {
-          continue
+            continue
         }
         if InStr(txt, "Scan was modified")
             return true
@@ -170,7 +257,6 @@ HandleScanModifiedOnce() {
     if !hwnd
         return false
 
-    ; NEW: verify it's the right dialog
     if !IsScanModifiedDialog(hwnd)
         return false
 
@@ -197,7 +283,7 @@ IsDeleteScansDialog() {
     Loop 10 {
         try txt := ControlGetText("Static" A_Index, "ahk_id " hwnd)
         catch {
-          continue
+            continue
         }
         if InStr(txt, "delete '/Scans'")
             return true
@@ -235,21 +321,17 @@ DrainExportCompletion(maxSeconds := 7200, idleMs := 25000) {
 
         handled := false
 
-        ; 1) file exists confirm
         if WinExist("Confirm") {
             HandleFileExistsConfirmOnce()
             handled := true
             lastDialogSeen := A_TickCount
         }
 
-        ; 2) scan modified prompt (can be MANY)
-        ; handle repeatedly in case a new one pops instantly
         if HandleScanModifiedOnce() {
             handled := true
             lastDialogSeen := A_TickCount
         }
 
-        ; If nothing handled, check idle timer
         if !handled {
             if (A_TickCount - lastDialogSeen) > idleMs
                 return true
@@ -269,11 +351,9 @@ ExportAllFromScansRoot(outDir) {
 
     ActivateScene()
 
-    ; focus Scans root
     ClickAtWindow(SCANS_ROOT_X, SCANS_ROOT_Y, "Left")
     Sleep 200
 
-    ; open context menu
     if useBlockInput
         BlockInput false
 
@@ -288,7 +368,6 @@ ExportAllFromScansRoot(outDir) {
         return false
     }
 
-    ; export -> panoramic images -> scan resolution
     Send "e"
     Sleep 200
     Send "p"
@@ -296,13 +375,11 @@ ExportAllFromScansRoot(outDir) {
     Send "s"
     Sleep 600
 
-    ; wait folder picker
     if !WinWaitActive(exportDlgTitle, , 20) {
         MsgBox "Did not reach export folder picker."
         return false
     }
 
-    ; dialog-relative -> screen coords
     WinGetPos &dlgX, &dlgY, &dlgW, &dlgH, exportDlgTitle
     fieldX := dlgX + EXPORT_FOLDER_FIELD_WX
     fieldY := dlgY + EXPORT_FOLDER_FIELD_WY
@@ -314,7 +391,6 @@ ExportAllFromScansRoot(outDir) {
 
     CoordMode "Mouse", "Screen"
 
-    ; paste outDir
     MouseMove fieldX, fieldY, 0
     Sleep 50
     Click "Left"
@@ -327,7 +403,6 @@ ExportAllFromScansRoot(outDir) {
     Send "^v"
     Sleep 200
 
-    ; click Select Folder ONCE
     MouseMove btnX, btnY, 0
     Sleep 50
     Click "Left"
@@ -338,7 +413,6 @@ ExportAllFromScansRoot(outDir) {
 
     CoordMode "Mouse", "Window"
 
-    ; >>> CRITICAL: WAIT until export has really finished <<<
     ToolTip "Waiting for export to finish (draining dialogs)..."
     ok := DrainExportCompletion(EXPORT_MAX_SEC, EXPORT_IDLE_MS)
     ToolTip
@@ -350,15 +424,12 @@ DeleteScansRoot() {
     global SCANS_ROOT_X, SCANS_ROOT_Y
     ActivateScene()
 
-    ; select scans root
     ClickAtWindow(SCANS_ROOT_X, SCANS_ROOT_Y, "Left")
     Sleep 150
 
-    ; press Delete key
     Send "{Del}"
     Sleep 150
 
-    ; confirm Yes
     HandleDeleteScansConfirm()
     Sleep 500
 }
@@ -378,13 +449,33 @@ ReadManifest(path) {
     return out
 }
 
-; ---------- Main ----------
-flsFiles := ReadManifest(manifest)
-total := flsFiles.Length
-if (total = 0) {
+; =========================
+; Main (adds logging + resume + JPG verification ON EXPORT)
+; =========================
+
+flsFilesAll := ReadManifest(manifest)
+totalAll := flsFilesAll.Length
+if (totalAll = 0) {
     MsgBox "Manifest has 0 paths."
     ExitApp 2
 }
+
+doneSet := LoadDoneSet(donePath)
+
+; Filter out already-processed paths (resume)
+flsFiles := []
+for _, p in flsFilesAll {
+    if !doneSet.Has(p)
+        flsFiles.Push(p)
+}
+
+total := flsFiles.Length
+if (total = 0) {
+    MsgBox "All scans already processed (per processed.txt). Nothing to do."
+    ExitApp 0
+}
+
+LogEvent("START", "-", "-", total, "-")
 
 idx := 1
 batchNum := 0
@@ -395,30 +486,75 @@ while (idx <= total) {
     batchEnd := Min(idx + BATCH_SIZE - 1, total)
     batchCount := batchEnd - batchStart + 1
 
+    batchPaths := []
+    LogEvent("BATCH_START", batchNum, batchStart, total, "-")
+
     ; IMPORT batch
     Loop batchCount {
         flsPath := flsFiles[idx]
-        ToolTip "BATCH " batchNum ": Importing " (idx) "/" total "`n" flsPath
+        batchPaths.Push(flsPath)
+
+        ToolTip "BATCH " batchNum ": Importing " idx "/" total "`n" flsPath
+        LogEvent("IMPORT_BEGIN", batchNum, idx, total, flsPath)
+
         ImportOneFls(flsPath)
+
+        LogEvent("IMPORT_OK", batchNum, idx, total, flsPath)
+
         idx++
         Sleep 300
     }
 
+    ; --- JPG baseline BEFORE export ---
+    baseJpg := CountJpgs(outDir)
+    LogEvent("BATCH_EXPORT_BASE_JPG", batchNum, "-", total, "base=" baseJpg)
+
     ToolTip "BATCH " batchNum ": Exporting once from Scans root..."
+    LogEvent("BATCH_EXPORT_BEGIN", batchNum, "-", total, "-")
+
     ok := ExportAllFromScansRoot(outDir)
     ToolTip
 
     if !ok {
+        LogEvent("ERROR_EXPORT_TIMEOUT", batchNum, "-", total, "-")
         MsgBox "Export did not reach idle/finish state. Stopping to avoid deleting scans mid-export."
         ExitApp 1
     }
 
-    ToolTip "BATCH " batchNum ": Export finished. Deleting Scans..."
-    DeleteScansRoot()
+    LogEvent("BATCH_EXPORT_OK", batchNum, "-", total, "-")
+
+    ; --- Verify JPGs exist AFTER export (by growth) ---
+    ToolTip "BATCH " batchNum ": Verifying JPGs were created..."
+    jpgOk := WaitForJpgGrowth(outDir, batchCount, baseJpg, JPG_WAIT_MAX_SEC, JPG_IDLE_MS)
     ToolTip
 
+    if !jpgOk {
+        LogEvent("ERROR_JPG_NOT_CREATED", batchNum, "-", total, "expected_inc=" batchCount ", base=" baseJpg)
+        MsgBox "Export finished but JPG count did NOT increase by at least " batchCount ". Stopping (won't delete scans, won't mark processed)."
+        ExitApp 1
+    }
+
+    afterJpg := CountJpgs(outDir)
+    LogEvent("BATCH_JPG_OK", batchNum, "-", total, "after=" afterJpg)
+
+    ToolTip "BATCH " batchNum ": Export finished. Deleting Scans..."
+    LogEvent("BATCH_DELETE_BEGIN", batchNum, "-", total, "-")
+
+    DeleteScansRoot()
+
+    LogEvent("BATCH_DELETE_OK", batchNum, "-", total, "-")
+
+    ; Commit processed ONLY after export OK + JPG verified + delete done
+    AppendDoneList(donePath, batchPaths)
+    for _, p in batchPaths
+        doneSet[p] := true
+
+    LogEvent("BATCH_COMMIT_OK", batchNum, "-", total, "-")
+
+    ToolTip
     Sleep 800
 }
 
+LogEvent("DONE", "-", "-", total, "-")
 MsgBox "Done. Processed " total " scans in batches of " BATCH_SIZE "."
 ExitApp 0
