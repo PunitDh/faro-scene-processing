@@ -135,9 +135,9 @@ def main() -> int:
     ap.add_argument("--ahk", type=Path, default=Path("scene_export.ahk"), help="Your working AHK script")
     ap.add_argument("--autohotkey-exe", type=Path, default=None, help="Path to AutoHotkey.exe (optional)")
     ap.add_argument("--batch-size", type=int, default=10)
-    ap.add_argument("--work-dir", type=Path, default=Path("work_scene"))
-    ap.add_argument("--resume-log", type=Path, default=Path("work_scene/processed_targets.txt"))
-    ap.add_argument("--csv-log", type=Path, default=Path("work_scene/run_log.csv"))
+    ap.add_argument("--work-dir", type=Path, default=Path("work"))
+    ap.add_argument("--resume-log", type=Path, default=Path("log/processed_targets.txt"))
+    ap.add_argument("--csv-log", type=Path, default=Path("log/run_log.csv"))
     args = ap.parse_args()
 
     input_json: Path = args.input_json.resolve()

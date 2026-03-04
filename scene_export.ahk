@@ -62,8 +62,8 @@ EXPORT_IDLE_MS := 25000         ; must be QUIET for 25s to consider export finis
 EXPORT_MAX_SEC := 7200          ; 2 hours max safety timeout
 
 ; --- NEW: logging / resume ---
-logCsvPath := A_ScriptDir "log\scene_export_log.csv"
-donePath   := A_ScriptDir "log\processed.txt"
+logCsvPath := A_ScriptDir "\log\scene_export_log.csv"
+donePath   := A_ScriptDir "\log\processed.txt"
 
 ; --- NEW: JPG verification (on EXPORT only) ---
 ; We only mark processed if jpg count increases by at least batchCount.

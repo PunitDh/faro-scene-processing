@@ -4,3 +4,4 @@ input/*.json
 work/*.txt
 log/*.txt
 log/*.csv
+out/*
