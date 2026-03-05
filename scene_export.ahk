@@ -1,5 +1,5 @@
 ^q:: {
-    ToolTip "Script aborted."
+    MsgBox "Script aborted."
     Sleep 500
     ExitApp
 }
@@ -24,6 +24,15 @@ if !FileExist(manifest) {
 if !DirExist(outDir)
     DirCreate outDir
 
+; Split staging outputs (so Python can pick them up reliably)
+outDirFull := outDir "\FullColor"
+outDirScan := outDir "\ScanResolution"
+
+if !DirExist(outDirFull)
+    DirCreate outDirFull
+if !DirExist(outDirScan)
+    DirCreate outDirScan
+
 ; =========================
 ; TUNE THESE
 ; =========================
@@ -47,6 +56,15 @@ SCANS_ROOT_Y := 232
 IMPORT_RESULTS_OK_X := 1250
 IMPORT_RESULTS_OK_Y := 690
 
+; --- Load All Scans wait ---
+LOADALL_QUIET_MS := 5000     ; must be gone for 5s
+LOADALL_MAX_SEC  := 7200     ; safety timeout (2h)
+
+; --- Full Color export progress wait ---
+FULLCOLOR_QUIET_MS := 5000    ; must be gone for 5s
+FULLCOLOR_MAX_SEC  := 7200    ; safety timeout (2h)
+FULLCOLOR_MUSTSEE_MS := 60000 ; must detect the dialog at least once within 60s
+
 exportDlgTitle := "Select folder for images export"
 
 useBlockInput := true
@@ -58,19 +76,26 @@ EXPORT_SELECT_BTN_WX   := 715
 EXPORT_SELECT_BTN_WY   := 550
 
 ; WAIT logic (existing)
-EXPORT_IDLE_MS := 25000         ; must be QUIET for 25s to consider export finished
+EXPORT_IDLE_MS := 10000         ; must be QUIET for 10s to consider export finished
 EXPORT_MAX_SEC := 7200          ; 2 hours max safety timeout
 
-; --- NEW: logging / resume ---
+; --- logging / resume ---
 logCsvPath := A_ScriptDir "\log\scene_export_log.csv"
 donePath   := A_ScriptDir "\log\processed.txt"
 
-; --- NEW: JPG verification (on EXPORT only) ---
-; We only mark processed if jpg count increases by at least batchCount.
+; --- JPG verification (on Scan-Resolution EXPORT only) ---
 JPG_WAIT_MAX_SEC := 3600        ; 1 hour max wait for jpg growth after export completes
 JPG_IDLE_MS      := 8000        ; if jpg count doesn't change for 8s, we treat as stalled (fail)
 
+; --- NEW: PNG verification (FullColor) ---
+PNG_WAIT_MAX_SEC := 7200        ; can be long
+PNG_IDLE_MS      := 10000       ; if png count doesn't change for 10s, we treat as stalled (fail)
+
 ; =========================
+
+; Ensure log dir exists
+if !DirExist(A_ScriptDir "\log")
+    DirCreate A_ScriptDir "\log"
 
 ; ---------- Logging helpers ----------
 NowStamp() {
@@ -78,7 +103,6 @@ NowStamp() {
 }
 
 CsvEscape(s) {
-    ; CSV rule: double any internal quotes, then wrap whole field in quotes
     s := StrReplace(s, '"', '""')
     return '"' s '"'
 }
@@ -113,7 +137,7 @@ AppendDoneList(path, flsArray) {
     FileAppend out, path, "UTF-8"
 }
 
-; ---------- JPG verification helpers (EXPORT only) ----------
+; ---------- JPG verification helpers ----------
 CountJpgs(dir) {
     c := 0
     Loop Files dir "\*.jpg", "FR"
@@ -148,8 +172,41 @@ WaitForJpgGrowth(dir, expectedIncrease, baseCount, maxSec := 3600, idleMs := 800
     }
 }
 
+; ---------- PNG verification helpers ----------
+CountPngs(dir) {
+    c := 0
+    Loop Files dir "\*.png", "FR"
+        c++
+    return c
+}
+
+WaitForPngGrowth(dir, expectedIncrease, baseCount, maxSec := 7200, idleMs := 10000) {
+    target := baseCount + expectedIncrease
+    start := A_TickCount
+    lastChange := A_TickCount
+    lastCount := baseCount
+
+    Loop {
+        if (A_TickCount - start) > (maxSec * 1000)
+            return false
+
+        cur := CountPngs(dir)
+        if (cur >= target)
+            return true
+
+        if (cur != lastCount) {
+            lastCount := cur
+            lastChange := A_TickCount
+        } else {
+            if (A_TickCount - lastChange) > idleMs
+                return false
+        }
+        Sleep 500
+    }
+}
+
 ; =========================
-; EXISTING WORKING FUNCTIONS (UNCHANGED BEHAVIOR)
+; EXISTING WORKING FUNCTIONS
 ; =========================
 
 ActivateScene() {
@@ -167,6 +224,35 @@ ClickAtWindow(x, y, button := "Left") {
 }
 
 ; ---------- Import ----------
+; ---------- Import (ROBUST) ----------
+FindImportDialogHwnd(timeoutMs := 15000) {
+    start := A_TickCount
+    Loop {
+        if (A_TickCount - start) > timeoutMs
+            return 0
+
+        ; scan all dialogs
+        list := WinGetList("ahk_class #32770")
+        for _, hwnd in list {
+            ; must be SCENE-owned dialog (helps avoid random dialogs)
+            try proc := WinGetProcessName("ahk_id " hwnd)
+            catch
+                continue
+            if !(proc = "SCENE.exe" || proc = "Scene.exe")
+                continue
+
+            ; Import dialog should have an Edit1 path box
+            if !ControlExists("Edit1", "ahk_id " hwnd)
+                continue
+
+            ; Usually has a button like Open/OK/Import as Button1 or Button2
+            ; We don't care which—Edit1 is the key.
+            return hwnd
+        }
+        Sleep 100
+    }
+}
+
 ImportOneFls(flsPath) {
     global IMPORT_BTN_X, IMPORT_BTN_Y, waitImportMs
     global IMPORT_RESULTS_OK_X, IMPORT_RESULTS_OK_Y
@@ -175,14 +261,27 @@ ImportOneFls(flsPath) {
 
     ActivateScene()
 
+    ; click Import
     ClickAtWindow(IMPORT_BTN_X, IMPORT_BTN_Y, "Left")
-    WinWaitActive "Import Scans", , 15
+    Sleep 150
 
-    ControlSetText flsPath, "Edit1", "Import Scans"
+    ; wait for the import dialog by HWND, not title
+    hwnd := FindImportDialogHwnd(15000)
+    if !hwnd {
+        MsgBox "Import dialog not found after clicking Import."
+        ExitApp 1
+    }
+
+    WinActivate "ahk_id " hwnd
+    WinWaitActive "ahk_id " hwnd, , 5
+
+    ; Set path and confirm
+    ControlSetText flsPath, "Edit1", "ahk_id " hwnd
     Sleep 150
     Send "{Enter}"
     Sleep 300
 
+    ; wait for SCENE’s custom “Import results” OK
     Sleep importResultsOkDelayMs
 
     if useBlockInput
@@ -310,8 +409,8 @@ HandleDeleteScansConfirm() {
     return true
 }
 
-; ---------- THIS is the critical “wait until export is done” gate ----------
-DrainExportCompletion(maxSeconds := 7200, idleMs := 25000) {
+; ---------- “wait until export is done” gate for Scan Resolution ----------
+DrainExportCompletion(maxSeconds := 7200, idleMs := 10000) {
     start := A_TickCount
     lastDialogSeen := A_TickCount
 
@@ -340,13 +439,370 @@ DrainExportCompletion(maxSeconds := 7200, idleMs := 25000) {
     }
 }
 
-; ---------- Export once from Scans root ----------
-ExportAllFromScansRoot(outDir) {
-    global SCANS_ROOT_X, SCANS_ROOT_Y
+ControlExists(ctrl, winTitle) {
+    try {
+        ControlGetHwnd(ctrl, winTitle)
+        return true
+    } catch {
+        return false
+    }
+}
+
+WindowHasStaticText(hwnd, needle) {
+    Loop 20 {
+        try txt := ControlGetText("Static" A_Index, "ahk_id " hwnd)
+        catch
+            continue
+        if (txt != "" && InStr(txt, needle))
+            return true
+    }
+    return false
+}
+
+; ---------- Load All Scans progress detection ----------
+IsLoadAllScansProgress(hwnd) {
+    try cls := WinGetClass("ahk_id " hwnd)
+    catch
+        return false
+    if (cls != "#32770")
+        return false
+
+    title := ""
+    try title := WinGetTitle("ahk_id " hwnd)
+    catch
+        return false
+    if !InStr(title, "Load all scans")
+        return false
+
+    if ControlExists("Button1", "ahk_id " hwnd) {
+        b := ""
+        try b := ControlGetText("Button1", "ahk_id " hwnd)
+        catch
+            b := ""
+        if InStr(b, "Abort")
+            return true
+    }
+
+    if WindowHasStaticText(hwnd, "Load data")
+        return true
+
+    if ControlExists("msctls_progress321", "ahk_id " hwnd)
+        return true
+    if ControlExists("msctls_progress322", "ahk_id " hwnd)
+        return true
+
+    return false
+}
+
+FindLoadAllScansProgressHwnd() {
+    list := WinGetList("ahk_class #32770")
+    for _, hwnd in list {
+        if IsLoadAllScansProgress(hwnd)
+            return hwnd
+    }
+    return 0
+}
+
+WaitForLoadAllScansDone(maxSec := 7200, quietMs := 5000, mustSeeMs := 60000) {
+    start := A_TickCount
+    firstSeen := 0
+    lastSeen := 0
+
+    Loop {
+        now := A_TickCount
+        if (now - start) > (maxSec * 1000)
+            return false
+
+        hwnd := FindLoadAllScansProgressHwnd()
+        if (hwnd) {
+            if (!firstSeen)
+                firstSeen := now
+            lastSeen := now
+            Sleep 200
+            continue
+        }
+
+        if (!firstSeen) {
+            if ((now - start) > mustSeeMs)
+                return false
+            Sleep 200
+            continue
+        }
+
+        if ((now - lastSeen) > quietMs)
+            return true
+
+        Sleep 200
+    }
+}
+
+; ---------- Panoramic success dialog (OK) ----------
+IsPanoramicSuccessDialog(hwnd) {
+    try cls := WinGetClass("ahk_id " hwnd)
+    catch
+        return false
+    if (cls != "#32770")
+        return false
+
+    if WindowHasStaticText(hwnd, "Successfully created panoramic images")
+        return true
+
+    return false
+}
+
+FindPanoramicSuccessHwnd() {
+    list := WinGetList("ahk_class #32770")
+    for _, hwnd in list {
+        if IsPanoramicSuccessDialog(hwnd)
+            return hwnd
+    }
+    return 0
+}
+
+DismissPanoramicSuccessIfPresent() {
+    hwnd := FindPanoramicSuccessHwnd()
+    if !hwnd
+        return false
+
+    WinActivate "ahk_id " hwnd
+    WinWaitActive "ahk_id " hwnd, , 2
+    Sleep 80
+
+    if ControlExists("Button1", "ahk_id " hwnd) {
+        b := ""
+        try b := ControlGetText("Button1", "ahk_id " hwnd)
+        catch
+            b := ""
+        if (b = "OK") {
+            ControlClick "Button1", "ahk_id " hwnd
+            Sleep 150
+            return true
+        }
+    }
+
+    Send "{Enter}"
+    Sleep 150
+    return true
+}
+
+; ---------- Full Color export progress detection ----------
+IsFullColorExportProgress(hwnd) {
+    ; Dialog title like: "Creating full resolution panoramic images 8%"
+    try cls := WinGetClass("ahk_id " hwnd)
+    catch
+        return false
+    if (cls != "#32770")
+        return false
+
+    title := ""
+    try title := WinGetTitle("ahk_id " hwnd)
+    catch
+        return false
+
+    if !InStr(title, "Creating full resolution panoramic images")
+        return false
+
+    if ControlExists("Button1", "ahk_id " hwnd) {
+        b := ""
+        try b := ControlGetText("Button1", "ahk_id " hwnd)
+        catch
+            b := ""
+        if InStr(b, "Abort")
+            return true
+    }
+
+    if WindowHasStaticText(hwnd, "Creating full resolution panoramic images")
+        return true
+
+    return true
+}
+
+FindFullColorExportProgressHwnd() {
+    list := WinGetList("ahk_class #32770")
+    for _, hwnd in list {
+        if IsFullColorExportProgress(hwnd)
+            return hwnd
+    }
+    return 0
+}
+
+WaitForFullColorExportDone(maxSec := 7200, quietMs := 5000, mustSeeMs := 60000) {
+    start := A_TickCount
+    firstSeen := 0
+    lastSeen := 0
+
+    Loop {
+        now := A_TickCount
+        if (now - start) > (maxSec * 1000)
+            return false
+
+        ; drain known popups while waiting
+        if WinExist("Confirm")
+            HandleFileExistsConfirmOnce()
+        HandleScanModifiedOnce()
+        DismissPanoramicSuccessIfPresent()
+
+        hwnd := FindFullColorExportProgressHwnd()
+        if (hwnd) {
+            if (!firstSeen)
+                firstSeen := now
+            lastSeen := now
+            Sleep 200
+            continue
+        }
+
+        if (!firstSeen) {
+            if ((now - start) > mustSeeMs)
+                return false
+            Sleep 200
+            continue
+        }
+
+        if ((now - lastSeen) > quietMs) {
+            ; success dialog can appear after progress ends
+            endStart := A_TickCount
+            while (A_TickCount - endStart) < 8000 {
+                if DismissPanoramicSuccessIfPresent()
+                    break
+                Sleep 200
+            }
+            return true
+        }
+
+        Sleep 200
+    }
+}
+
+; ---------- Load All Scans ONCE (Right click Scans, Down x4, Enter) ----------
+LoadAllScansOnce() {
+    global SCANS_ROOT_X, SCANS_ROOT_Y, useBlockInput
+    global LOADALL_MAX_SEC, LOADALL_QUIET_MS
+
+    ActivateScene()
+
+    ClickAtWindow(SCANS_ROOT_X, SCANS_ROOT_Y, "Left")
+    Sleep 200
+
+    if useBlockInput
+        BlockInput false
+
+    Send "{AppsKey}"
+    Sleep 150
+    if !WinWait("ahk_class #32768", , 1) {
+        Send "+{F10}"
+        Sleep 150
+    }
+
+    if !WinWait("ahk_class #32768", , 2) {
+        MsgBox "Context menu did not open for Scans root (Load All Scans)."
+        return false
+    }
+
+    Send "{Down 4}{Enter}"
+    Sleep 250
+
+    ToolTip "Loading all scans... waiting for progress dialog to finish (quiet " (LOADALL_QUIET_MS/1000) "s)"
+    ok := WaitForLoadAllScansDone(LOADALL_MAX_SEC, LOADALL_QUIET_MS, 60000)
+    ToolTip
+
+    return ok
+}
+
+; ---------- Helper: fill export folder picker ----------
+FillExportFolderPicker(targetDir) {
     global exportDlgTitle
     global useBlockInput
     global EXPORT_FOLDER_FIELD_WX, EXPORT_FOLDER_FIELD_WY
     global EXPORT_SELECT_BTN_WX, EXPORT_SELECT_BTN_WY
+
+    WinGetPos &dlgX, &dlgY, &dlgW, &dlgH, exportDlgTitle
+    fieldX := dlgX + EXPORT_FOLDER_FIELD_WX
+    fieldY := dlgY + EXPORT_FOLDER_FIELD_WY
+    btnX   := dlgX + EXPORT_SELECT_BTN_WX
+    btnY   := dlgY + EXPORT_SELECT_BTN_WY
+
+    if useBlockInput
+        BlockInput true
+
+    CoordMode "Mouse", "Screen"
+
+    MouseMove fieldX, fieldY, 0
+    Sleep 50
+    Click "Left"
+    Sleep 120
+
+    Send "^a"
+    Sleep 80
+    A_Clipboard := targetDir
+    Sleep 80
+    Send "^v"
+    Sleep 200
+
+    MouseMove btnX, btnY, 0
+    Sleep 50
+    Click "Left"
+    Sleep 250
+
+    if useBlockInput
+        BlockInput false
+
+    CoordMode "Mouse", "Window"
+}
+
+; ---------- Full Color export from Scans root (creates PNG) ----------
+ExportAllFromScansRoot_FullColor(outDirFull) {
+    global SCANS_ROOT_X, SCANS_ROOT_Y
+    global exportDlgTitle
+    global useBlockInput
+    global FULLCOLOR_MAX_SEC, FULLCOLOR_QUIET_MS, FULLCOLOR_MUSTSEE_MS
+
+    ActivateScene()
+
+    ClickAtWindow(SCANS_ROOT_X, SCANS_ROOT_Y, "Left")
+    Sleep 200
+
+    if useBlockInput
+        BlockInput false
+
+    Send "{AppsKey}"
+    Sleep 150
+    if !WinWait("ahk_class #32768", , 1) {
+        Send "+{F10}"
+        Sleep 150
+    }
+    if !WinWait("ahk_class #32768", , 2) {
+        MsgBox "Export context menu did not open (Full Color). SCANS_ROOT_X/Y likely wrong."
+        return "FAIL"
+    }
+
+    ; Export -> Panoramic Images -> Full Color Resolution (2nd item)
+    Send "e"
+    Sleep 200
+    Send "p"
+    Sleep 200
+    Send "{Down}{Enter}"
+    Sleep 250
+
+    ; FAILSAFE: if folder picker doesn't appear quickly, assume Full Color is disabled
+    if !WinWaitActive(exportDlgTitle, , 10) {
+        DismissPanoramicSuccessIfPresent()
+        return "SKIPPED"
+    }
+
+    FillExportFolderPicker(outDirFull)
+
+    ToolTip "Full Color export running... waiting for progress dialog to finish (quiet " (FULLCOLOR_QUIET_MS/1000) "s)"
+    ok := WaitForFullColorExportDone(FULLCOLOR_MAX_SEC, FULLCOLOR_QUIET_MS, FULLCOLOR_MUSTSEE_MS)
+    ToolTip
+
+    return ok ? "OK" : "FAIL"
+}
+
+; ---------- Scan Resolution export from Scans root (JPG) ----------
+ExportAllFromScansRoot_Scan(outDirScan) {
+    global SCANS_ROOT_X, SCANS_ROOT_Y
+    global exportDlgTitle
+    global useBlockInput
     global EXPORT_MAX_SEC, EXPORT_IDLE_MS
 
     ActivateScene()
@@ -368,6 +824,7 @@ ExportAllFromScansRoot(outDir) {
         return false
     }
 
+    ; Export -> Panoramic Images -> Scan Resolution
     Send "e"
     Sleep 200
     Send "p"
@@ -380,40 +837,9 @@ ExportAllFromScansRoot(outDir) {
         return false
     }
 
-    WinGetPos &dlgX, &dlgY, &dlgW, &dlgH, exportDlgTitle
-    fieldX := dlgX + EXPORT_FOLDER_FIELD_WX
-    fieldY := dlgY + EXPORT_FOLDER_FIELD_WY
-    btnX   := dlgX + EXPORT_SELECT_BTN_WX
-    btnY   := dlgY + EXPORT_SELECT_BTN_WY
+    FillExportFolderPicker(outDirScan)
 
-    if useBlockInput
-        BlockInput true
-
-    CoordMode "Mouse", "Screen"
-
-    MouseMove fieldX, fieldY, 0
-    Sleep 50
-    Click "Left"
-    Sleep 120
-
-    Send "^a"
-    Sleep 80
-    A_Clipboard := outDir
-    Sleep 80
-    Send "^v"
-    Sleep 200
-
-    MouseMove btnX, btnY, 0
-    Sleep 50
-    Click "Left"
-    Sleep 250
-
-    if useBlockInput
-        BlockInput false
-
-    CoordMode "Mouse", "Window"
-
-    ToolTip "Waiting for export to finish (draining dialogs)..."
+    ToolTip "Waiting for Scan Resolution export to finish (draining dialogs)..."
     ok := DrainExportCompletion(EXPORT_MAX_SEC, EXPORT_IDLE_MS)
     ToolTip
     return ok
@@ -450,7 +876,7 @@ ReadManifest(path) {
 }
 
 ; =========================
-; Main (adds logging + resume + JPG verification ON EXPORT)
+; Main
 ; =========================
 
 flsFilesAll := ReadManifest(manifest)
@@ -505,27 +931,68 @@ while (idx <= total) {
         Sleep 300
     }
 
-    ; --- JPG baseline BEFORE export ---
-    baseJpg := CountJpgs(outDir)
+    ; Load All Scans ONCE
+    ToolTip "BATCH " batchNum ": Load All Scans (Down x4, Enter)..."
+    LogEvent("BATCH_LOAD_ALL_BEGIN", batchNum, "-", total, "-")
+
+    okLoad := LoadAllScansOnce()
+    ToolTip
+
+    if !okLoad {
+        LogEvent("ERROR_LOAD_ALL_FAILED", batchNum, "-", total, "-")
+        MsgBox "Load All Scans failed. Stopping before export."
+        ExitApp 1
+    }
+
+    LogEvent("BATCH_LOAD_ALL_OK", batchNum, "-", total, "-")
+
+    ; 1) FULL COLOR export (PNG)
+    basePng := CountPngs(outDirFull)
+    LogEvent("BATCH_EXPORT_BASE_PNG", batchNum, "-", total, "base=" basePng)
+
+    ToolTip "BATCH " batchNum ": Exporting Full Color Resolution (PNG)..."
+    LogEvent("BATCH_EXPORT_FULLCOLOR_BEGIN", batchNum, "-", total, "-")
+
+    fc := ExportAllFromScansRoot_FullColor(outDirFull)
+    ToolTip
+
+    if (fc = "SKIPPED") {
+        LogEvent("BATCH_EXPORT_FULLCOLOR_SKIPPED", batchNum, "-", total, "-")
+    } else if (fc = "FAIL") {
+        LogEvent("ERROR_FULLCOLOR_EXPORT_FAILED", batchNum, "-", total, "-")
+        MsgBox "Full Color export failed. Stopping before Scan Resolution export."
+        ExitApp 1
+    } else {
+        LogEvent("BATCH_EXPORT_FULLCOLOR_OK", batchNum, "-", total, "-")
+
+        ; Do NOT require PNGs (some scans are B/W-only).
+        ; Just log how many PNGs we ended up with.
+        afterPng := CountPngs(outDirFull)
+        incPng := afterPng - basePng
+        LogEvent("BATCH_PNG_COUNT", batchNum, "-", total, "base=" basePng ", after=" afterPng ", inc=" incPng)
+    }
+
+    ; 2) Scan Resolution export (JPG)
+    baseJpg := CountJpgs(outDirScan)
     LogEvent("BATCH_EXPORT_BASE_JPG", batchNum, "-", total, "base=" baseJpg)
 
-    ToolTip "BATCH " batchNum ": Exporting once from Scans root..."
+    ToolTip "BATCH " batchNum ": Exporting Scan Resolution (JPG)..."
     LogEvent("BATCH_EXPORT_BEGIN", batchNum, "-", total, "-")
 
-    ok := ExportAllFromScansRoot(outDir)
+    ok := ExportAllFromScansRoot_Scan(outDirScan)
     ToolTip
 
     if !ok {
         LogEvent("ERROR_EXPORT_TIMEOUT", batchNum, "-", total, "-")
-        MsgBox "Export did not reach idle/finish state. Stopping to avoid deleting scans mid-export."
+        MsgBox "Scan Resolution export did not reach idle/finish state. Stopping to avoid deleting scans mid-export."
         ExitApp 1
     }
 
     LogEvent("BATCH_EXPORT_OK", batchNum, "-", total, "-")
 
-    ; --- Verify JPGs exist AFTER export (by growth) ---
+    ; Verify JPGs exist AFTER Scan Resolution export (by growth)
     ToolTip "BATCH " batchNum ": Verifying JPGs were created..."
-    jpgOk := WaitForJpgGrowth(outDir, batchCount, baseJpg, JPG_WAIT_MAX_SEC, JPG_IDLE_MS)
+    jpgOk := WaitForJpgGrowth(outDirScan, batchCount, baseJpg, JPG_WAIT_MAX_SEC, JPG_IDLE_MS)
     ToolTip
 
     if !jpgOk {
@@ -534,17 +1001,18 @@ while (idx <= total) {
         ExitApp 1
     }
 
-    afterJpg := CountJpgs(outDir)
+    afterJpg := CountJpgs(outDirScan)
     LogEvent("BATCH_JPG_OK", batchNum, "-", total, "after=" afterJpg)
 
-    ToolTip "BATCH " batchNum ": Export finished. Deleting Scans..."
+    ; Delete scans
+    ToolTip "BATCH " batchNum ": Exports finished. Deleting Scans..."
     LogEvent("BATCH_DELETE_BEGIN", batchNum, "-", total, "-")
 
     DeleteScansRoot()
 
     LogEvent("BATCH_DELETE_OK", batchNum, "-", total, "-")
 
-    ; Commit processed ONLY after export OK + JPG verified + delete done
+    ; Commit processed ONLY after exports OK + JPG verified + delete done
     AppendDoneList(donePath, batchPaths)
     for _, p in batchPaths
         doneSet[p] := true

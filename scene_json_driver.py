@@ -6,7 +6,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -25,18 +24,22 @@ class Job:
     def fls_stem(self) -> str:
         return self.source_fls.stem
 
-    def target_relpath(self) -> Path:
-        # {SiteName}/{AssetName}/{InspectionDate}/{SourceFolderNameAsFileName}.jpg
-        # NOTE: This can collide if multiple fls are in the same folder for same site/asset/date.
-        # We handle collisions by suffixing _2, _3, ...
-        filename = f"{self.source_folder_name}.jpg"
+    def target_relpath(self, ext: str) -> Path:
+        """
+        Final output path:
+          {SiteName}/{AssetName}/{InspectionDate}/{SourceFolderName}.{ext}
+
+        Notes:
+          - Same basename for both JPG + PNG so they sit side-by-side.
+          - Collision-handled via pick_unique_target() at move time.
+        """
+        ext = ext.lstrip(".").lower()
+        filename = f"{self.source_folder_name}.{ext}"
         return Path(self.site) / self.asset / self.inspection_date / filename
 
 
 def safe_name(s: str) -> str:
-    # Keep folder names Windows-friendly (you can loosen if you want)
     s = s.strip()
-    # Replace reserved characters: \ / : * ? " < > |
     return re.sub(r'[\\/:*?"<>|]+', "_", s)
 
 
@@ -77,13 +80,21 @@ def write_manifest(fls_paths: list[Path], manifest_path: Path) -> None:
             f.write(str(p) + "\n")
 
 
-def list_jpgs(folder: Path) -> list[Path]:
+def list_files_by_ext(folder: Path, exts: tuple[str, ...]) -> list[Path]:
     if not folder.exists():
         return []
-    out = []
-    out.extend(folder.rglob("*.jpg"))
-    out.extend(folder.rglob("*.jpeg"))
+    out: list[Path] = []
+    for ext in exts:
+        out.extend(folder.rglob(f"*.{ext.lstrip('.')}"))
     return sorted(out)
+
+
+def list_jpgs(folder: Path) -> list[Path]:
+    return list_files_by_ext(folder, ("jpg", "jpeg"))
+
+
+def list_pngs(folder: Path) -> list[Path]:
+    return list_files_by_ext(folder, ("png",))
 
 
 def pick_unique_target(target: Path) -> Path:
@@ -100,44 +111,71 @@ def pick_unique_target(target: Path) -> Path:
         k += 1
 
 
-def match_exported_jpg(job: Job, exported: list[Path]) -> Path | None:
+def match_exported_file(job: Job, exported: list[Path]) -> Path | None:
     """
     Heuristic matcher:
-      - Prefer JPG filenames containing the .fls stem (case-insensitive)
-      - If multiple matches, pick shortest name (usually most direct)
+      1) Prefer filenames containing job.fls_stem (case-insensitive)
+      2) Fallback: filenames containing source_folder_name (case-insensitive)
+      3) If multiple, pick shortest name then lexicographic
     """
-    needle = job.fls_stem.lower()
-    matches = [p for p in exported if needle in p.stem.lower()]
+    if not exported:
+        return None
+
+    needle1 = job.fls_stem.lower()
+    needle2 = job.source_folder_name.lower()
+
+    matches = [p for p in exported if needle1 in p.stem.lower()]
+    if not matches:
+        matches = [p for p in exported if needle2 in p.stem.lower()]
     if not matches:
         return None
+
     matches.sort(key=lambda p: (len(p.name), p.name.lower()))
     return matches[0]
 
 
 def append_csv(log_path: Path, row: list[str]) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    # Minimal CSV escaping
+
     def esc(s: str) -> str:
         s = s.replace('"', '""')
         return f'"{s}"'
+
+    if not log_path.exists():
+        log_path.write_text("", encoding="utf-8")
+
     line = ",".join(esc(x) for x in row) + "\n"
-    log_path.write_text("", encoding="utf-8") if not log_path.exists() else None
     with log_path.open("a", encoding="utf-8") as f:
         f.write(line)
+
+
+def run_ahk(ahk_exe: str, ahk_script: Path, manifest: Path, staging: Path) -> int:
+    # NOTE: AHK gets (manifest, output_folder). We pass staging as the output folder.
+    proc = subprocess.run([ahk_exe, str(ahk_script), str(manifest), str(staging)])
+    return proc.returncode
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Drive FARO SCENE export using AHK with JSON input + structured output folders."
     )
-    ap.add_argument("input_json", type=Path, help="JSON file like [{SourceFilePath,SiteName,AssetName,InspectionDate}, ...]")
+    ap.add_argument(
+        "input_json",
+        type=Path,
+        help="JSON file like [{SourceFilePath,SiteName,AssetName,InspectionDate}, ...]",
+    )
     ap.add_argument("output_dir", type=Path, help="Root output folder")
-    ap.add_argument("--ahk", type=Path, default=Path("scene_export.ahk"), help="Your working AHK script")
+    ap.add_argument("--ahk", type=Path, default=Path("scene_export.ahk"), help="Your AHK script")
     ap.add_argument("--autohotkey-exe", type=Path, default=None, help="Path to AutoHotkey.exe (optional)")
     ap.add_argument("--batch-size", type=int, default=10)
     ap.add_argument("--work-dir", type=Path, default=Path("work"))
     ap.add_argument("--resume-log", type=Path, default=Path("log/processed_targets.txt"))
     ap.add_argument("--csv-log", type=Path, default=Path("log/run_log.csv"))
+    ap.add_argument(
+        "--require-png",
+        action="store_true",
+        help="Fail the batch if a PNG cannot be found for a job (default: PNG is optional).",
+    )
     args = ap.parse_args()
 
     input_json: Path = args.input_json.resolve()
@@ -167,14 +205,15 @@ def main() -> int:
             if line:
                 done_targets.add(line)
 
-    # Filter jobs that already have their target jpg on disk OR are logged done
+    # Filter jobs that already have their target JPG on disk OR are logged done.
+    # (JPG is treated as the primary “done” artifact; PNG can be optional.)
     jobs: list[Job] = []
     for j in jobs_all:
-        target = out_root / j.target_relpath()
-        if str(target) in done_targets:
+        target_jpg = out_root / j.target_relpath("jpg")
+        if str(target_jpg) in done_targets:
             continue
-        if target.exists():
-            done_targets.add(str(target))
+        if target_jpg.exists():
+            done_targets.add(str(target_jpg))
             continue
         jobs.append(j)
 
@@ -189,13 +228,12 @@ def main() -> int:
     batch_num = 0
     idx = 0
 
-    # CSV header if new
     if not csv_log.exists():
         append_csv(csv_log, ["event", "batch", "index", "total", "source_fls", "staging", "target", "note"])
 
     while idx < total:
         batch_num += 1
-        batch_jobs = jobs[idx: idx + batch_size]
+        batch_jobs = jobs[idx : idx + batch_size]
         idx_end = idx + len(batch_jobs)
 
         staging = work_dir / f"staging_batch_{batch_num:04d}"
@@ -208,57 +246,100 @@ def main() -> int:
 
         append_csv(csv_log, ["BATCH_START", str(batch_num), f"{idx+1}", str(total), "-", str(staging), "-", f"count={len(batch_jobs)}"])
 
-        # Run AHK: (manifest, staging)
-        proc = subprocess.run([ahk_exe, str(ahk_script), str(manifest), str(staging)])
-        if proc.returncode != 0:
-            append_csv(csv_log, ["ERROR_AHK", str(batch_num), f"{idx+1}", str(total), "-", str(staging), "-", f"returncode={proc.returncode}"])
-            print(f"AHK failed on batch {batch_num} (returncode={proc.returncode}).", file=sys.stderr)
-            return proc.returncode or 1
+        rc = run_ahk(ahk_exe, ahk_script, manifest, staging)
+        if rc != 0:
+            append_csv(csv_log, ["ERROR_AHK", str(batch_num), f"{idx+1}", str(total), "-", str(staging), "-", f"returncode={rc}"])
+            print(f"AHK failed on batch {batch_num} (returncode={rc}).", file=sys.stderr)
+            return rc or 1
 
-        # After AHK returns, exported JPGs should be in staging
-        exported = list_jpgs(staging)
-        append_csv(csv_log, ["BATCH_EXPORTED", str(batch_num), f"{idx+1}", str(total), "-", str(staging), "-", f"jpgs_found={len(exported)}"])
+        # AHK might export into:
+        # - staging root, OR
+        # - staging/ScanResolution + staging/FullColor (recommended),
+        # so we search in BOTH the whole staging tree and the specific subfolders if present.
+        scan_dir = staging / "ScanResolution"
+        fc_dir = staging / "FullColor"
 
-        # Move + rename for each job; mark processed ONLY after the target exists
-        used: set[Path] = set()
+        # Collect JPGs
+        exported_jpgs = []
+        if scan_dir.exists():
+            exported_jpgs = list_jpgs(scan_dir)
+        if not exported_jpgs:
+            exported_jpgs = list_jpgs(staging)
+
+        # Collect PNGs
+        exported_pngs = []
+        if fc_dir.exists():
+            exported_pngs = list_pngs(fc_dir)
+        if not exported_pngs:
+            exported_pngs = list_pngs(staging)
+
+        append_csv(csv_log, ["BATCH_EXPORTED", str(batch_num), f"{idx+1}", str(total), "-", str(staging), "-", f"jpgs_found={len(exported_jpgs)} pngs_found={len(exported_pngs)}"])
+
+        used_jpg: set[Path] = set()
+        used_png: set[Path] = set()
+
         for j in batch_jobs:
-            target = out_root / j.target_relpath()
-            target.parent.mkdir(parents=True, exist_ok=True)
+            # ---- Move JPG (required) ----
+            target_jpg = out_root / j.target_relpath("jpg")
+            target_jpg.parent.mkdir(parents=True, exist_ok=True)
 
-            match = match_exported_jpg(j, [p for p in exported if p not in used])
-            if match is None:
-                append_csv(csv_log, ["ERROR_NO_MATCH", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(target), "no jpg matched fls stem"])
+            jpg_match = match_exported_file(j, [p for p in exported_jpgs if p not in used_jpg])
+            if jpg_match is None:
+                append_csv(csv_log, ["ERROR_NO_MATCH_JPG", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(target_jpg), "no jpg matched fls stem/folder"])
                 print(f"No JPG matched {j.source_fls.name} in staging batch {batch_num}. Stopping.", file=sys.stderr)
                 return 1
 
-            used.add(match)
+            used_jpg.add(jpg_match)
+            final_jpg = pick_unique_target(target_jpg)
+            shutil.move(str(jpg_match), str(final_jpg))
 
-            # Handle collisions safely
-            final_target = pick_unique_target(target)
-
-            # Move file
-            final_target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(match), str(final_target))
-
-            # Verify it exists (your directive)
-            if not final_target.exists():
-                append_csv(csv_log, ["ERROR_MOVE_FAILED", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(final_target), "move did not result in file on disk"])
-                print(f"Move failed for {match} -> {final_target}", file=sys.stderr)
+            if not final_jpg.exists():
+                append_csv(csv_log, ["ERROR_MOVE_FAILED_JPG", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(final_jpg), "move did not result in file on disk"])
+                print(f"Move failed for {jpg_match} -> {final_jpg}", file=sys.stderr)
                 return 1
 
-            # Mark processed
+            # Mark processed (JPG)
             with resume_log.open("a", encoding="utf-8") as f:
-                f.write(str(final_target) + "\n")
-            done_targets.add(str(final_target))
+                f.write(str(final_jpg) + "\n")
+            done_targets.add(str(final_jpg))
 
-            append_csv(csv_log, ["OK", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(final_target), ""])
+            # ---- Move PNG (optional unless --require-png) ----
+            target_png = out_root / j.target_relpath("png")
+            target_png.parent.mkdir(parents=True, exist_ok=True)
 
-        # Optional: If staging still has JPGs we didn't map, log it (doesn't fail)
-        leftovers = [p for p in list_jpgs(staging)]
-        if leftovers:
-            append_csv(csv_log, ["WARN_LEFTOVERS", str(batch_num), "-", str(total), "-", str(staging), "-", f"leftover_jpgs={len(leftovers)}"])
+            png_match = match_exported_file(j, [p for p in exported_pngs if p not in used_png])
+            if png_match is None:
+                note = "no png matched fls stem/folder"
+                if args.require_png:
+                    append_csv(csv_log, ["ERROR_NO_MATCH_PNG", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(target_png), note])
+                    print(f"No PNG matched {j.source_fls.name} in staging batch {batch_num}. Stopping (require-png).", file=sys.stderr)
+                    return 1
+                else:
+                    append_csv(csv_log, ["WARN_NO_PNG", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(target_png), note])
+            else:
+                used_png.add(png_match)
+                final_png = pick_unique_target(target_png)
+                shutil.move(str(png_match), str(final_png))
 
-        # Clean staging (optional)
+                if not final_png.exists():
+                    append_csv(csv_log, ["ERROR_MOVE_FAILED_PNG", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(final_png), "move did not result in file on disk"])
+                    print(f"Move failed for {png_match} -> {final_png}", file=sys.stderr)
+                    return 1
+
+                # Log PNG as processed too (handy for auditing)
+                with resume_log.open("a", encoding="utf-8") as f:
+                    f.write(str(final_png) + "\n")
+                done_targets.add(str(final_png))
+
+            append_csv(csv_log, ["OK", str(batch_num), "-", str(total), str(j.source_fls), str(staging), str(final_jpg), "jpg ok; png optional"])
+
+        # Log leftovers (non-fatal)
+        leftovers_j = list_jpgs(staging)
+        leftovers_p = list_pngs(staging)
+        if leftovers_j or leftovers_p:
+            append_csv(csv_log, ["WARN_LEFTOVERS", str(batch_num), "-", str(total), "-", str(staging), "-", f"leftover_jpgs={len(leftovers_j)} leftover_pngs={len(leftovers_p)}"])
+
+        # Clean staging
         shutil.rmtree(staging, ignore_errors=True)
 
         append_csv(csv_log, ["BATCH_DONE", str(batch_num), f"{idx_end}", str(total), "-", "-", "-", ""])
