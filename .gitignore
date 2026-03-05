@@ -5,3 +5,4 @@ work/*.txt
 log/*.txt
 log/*.csv
 out/*
+files/*
