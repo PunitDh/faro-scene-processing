@@ -410,6 +410,44 @@ HandleDeleteScansConfirm() {
 }
 
 ; ---------- “wait until export is done” gate for Scan Resolution ----------
+FindExportFolderPickerHwnd(timeoutMs := 10000) {
+    start := A_TickCount
+    Loop {
+        if (A_TickCount - start) > timeoutMs
+            return 0
+
+        list := WinGetList("ahk_class #32770")
+        for _, hwnd in list {
+            try proc := WinGetProcessName("ahk_id " hwnd)
+            catch
+                continue
+            if !(proc = "SCENE.exe" || proc = "Scene.exe")
+                continue
+
+            try title := WinGetTitle("ahk_id " hwnd)
+            catch
+                continue
+            if !InStr(title, "Select folder for images export")
+                continue
+
+            ; the real picker has an Edit1 path field
+            if !ControlExists("Edit1", "ahk_id " hwnd)
+                continue
+
+            return hwnd
+        }
+        Sleep 100
+    }
+}
+
+CancelTreeRenameAndMenus() {
+    ; ESC once usually cancels rename; twice is cheap insurance
+    Send "{Esc}"
+    Sleep 80
+    Send "{Esc}"
+    Sleep 80
+}
+
 DrainExportCompletion(maxSeconds := 7200, idleMs := 10000) {
     start := A_TickCount
     lastDialogSeen := A_TickCount
@@ -750,10 +788,11 @@ FillExportFolderPicker(targetDir) {
 }
 
 ; ---------- Full Color export from Scans root (creates PNG) ----------
-ExportAllFromScansRoot_FullColor(outDirFull) {
+ExportAllFromScansRoot_FullColor(outDir) {
     global SCANS_ROOT_X, SCANS_ROOT_Y
-    global exportDlgTitle
     global useBlockInput
+    global EXPORT_FOLDER_FIELD_WX, EXPORT_FOLDER_FIELD_WY
+    global EXPORT_SELECT_BTN_WX, EXPORT_SELECT_BTN_WY
     global FULLCOLOR_MAX_SEC, FULLCOLOR_QUIET_MS, FULLCOLOR_MUSTSEE_MS
 
     ActivateScene()
@@ -771,11 +810,11 @@ ExportAllFromScansRoot_FullColor(outDirFull) {
         Sleep 150
     }
     if !WinWait("ahk_class #32768", , 2) {
-        MsgBox "Export context menu did not open (Full Color). SCANS_ROOT_X/Y likely wrong."
+        MsgBox "Export context menu did not open (Full Color)."
         return "FAIL"
     }
 
-    ; Export -> Panoramic Images -> Full Color Resolution (2nd item)
+    ; Export -> Panoramic Images -> Full Color Resolution
     Send "e"
     Sleep 200
     Send "p"
@@ -783,15 +822,51 @@ ExportAllFromScansRoot_FullColor(outDirFull) {
     Send "{Down}{Enter}"
     Sleep 250
 
-    ; FAILSAFE: if folder picker doesn't appear quickly, assume Full Color is disabled
-    if !WinWaitActive(exportDlgTitle, , 10) {
+    ; HARD GATE: the folder picker must REALLY exist
+    dlgHwnd := FindExportFolderPickerHwnd(2500)
+    if !dlgHwnd {
+        ; Full Color likely disabled; prevent rename/paste chaos
+        CancelTreeRenameAndMenus()
         DismissPanoramicSuccessIfPresent()
         return "SKIPPED"
     }
 
-    FillExportFolderPicker(outDirFull)
+    WinActivate "ahk_id " dlgHwnd
+    WinWaitActive "ahk_id " dlgHwnd, , 5
 
-    ToolTip "Full Color export running... waiting for progress dialog to finish (quiet " (FULLCOLOR_QUIET_MS/1000) "s)"
+    WinGetPos &dlgX, &dlgY, &dlgW, &dlgH, "ahk_id " dlgHwnd
+    fieldX := dlgX + EXPORT_FOLDER_FIELD_WX
+    fieldY := dlgY + EXPORT_FOLDER_FIELD_WY
+    btnX   := dlgX + EXPORT_SELECT_BTN_WX
+    btnY   := dlgY + EXPORT_SELECT_BTN_WY
+
+    if useBlockInput
+        BlockInput true
+
+    CoordMode "Mouse", "Screen"
+    MouseMove fieldX, fieldY, 0
+    Sleep 50
+    Click "Left"
+    Sleep 120
+
+    Send "^a"
+    Sleep 80
+    A_Clipboard := outDir
+    Sleep 80
+    Send "^v"
+    Sleep 200
+
+    MouseMove btnX, btnY, 0
+    Sleep 50
+    Click "Left"
+    Sleep 250
+
+    if useBlockInput
+        BlockInput false
+
+    CoordMode "Mouse", "Window"
+
+    ToolTip "Full Color export running..."
     ok := WaitForFullColorExportDone(FULLCOLOR_MAX_SEC, FULLCOLOR_QUIET_MS, FULLCOLOR_MUSTSEE_MS)
     ToolTip
 
