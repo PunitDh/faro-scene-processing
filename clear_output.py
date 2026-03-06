@@ -15,7 +15,7 @@ def purge_dir(base: Path, dry_run: bool) -> tuple[int, int]:
     deleted_files = 0
     deleted_dirs = 0
 
-    if not base.exists():
+    if not base.exists() or base.is_symlink():
         return deleted_files, deleted_dirs
 
     for entry in base.iterdir():
@@ -26,7 +26,7 @@ def purge_dir(base: Path, dry_run: bool) -> tuple[int, int]:
             print(f"[DRY-RUN] DELETE {entry}")
             continue
 
-        if entry.is_dir():
+        if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
             deleted_dirs += 1
         else:
@@ -37,6 +37,8 @@ def purge_dir(base: Path, dry_run: bool) -> tuple[int, int]:
 
 
 def ensure_keep_file(base: Path, dry_run: bool) -> None:
+    if base.is_symlink():
+        return
     keep_path = base / KEEP_FILENAME
     if keep_path.exists():
         return
@@ -98,4 +100,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
