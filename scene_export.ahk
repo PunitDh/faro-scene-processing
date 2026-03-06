@@ -43,14 +43,21 @@ waitImportMs := 2000
 importResultsOkDelayMs := 1500
 
 ; --- SCENE window coords ---
-IMPORT_BTN_X := 60
-IMPORT_BTN_Y := 120
+; Import button coords no longer used in Classic Mode import
+; IMPORT_BTN_X := 60
+; IMPORT_BTN_Y := 120
 
 TREE_X := 80
 TREE_Y := 235
 
-SCANS_ROOT_X := 77
-SCANS_ROOT_Y := 232
+SCANS_ROOT_X := 67
+SCANS_ROOT_Y := 182
+
+; Import Data progress wait
+IMPORTDATA_QUIET_MS := 5000
+IMPORTDATA_MAX_SEC  := 7200
+IMPORTDATA_MUSTSEE_MS := 60000
+IMPORTDATA_APPEAR_GRACE_MS := 2500   ; if Import Data doesn't appear within this, assume import was too fast
 
 ; --- screen coords for SCENE custom import OK ---
 IMPORT_RESULTS_OK_X := 1250
@@ -253,22 +260,31 @@ FindImportDialogHwnd(timeoutMs := 15000) {
     }
 }
 
+WaitForWindowGone(winTitle, timeoutMs := 10000) {
+    start := A_TickCount
+    Loop {
+        if !WinExist(winTitle)
+            return true
+        if (A_TickCount - start) > timeoutMs
+            return false
+        Sleep 100
+    }
+}
+
 ImportOneFls(flsPath) {
-    global IMPORT_BTN_X, IMPORT_BTN_Y, waitImportMs
-    global IMPORT_RESULTS_OK_X, IMPORT_RESULTS_OK_Y
     global TREE_X, TREE_Y
-    global importResultsOkDelayMs, useBlockInput
+    global useBlockInput
+    global IMPORTDATA_MAX_SEC, IMPORTDATA_QUIET_MS, IMPORTDATA_APPEAR_GRACE_MS
 
     ActivateScene()
 
-    ; click Import
-    ClickAtWindow(IMPORT_BTN_X, IMPORT_BTN_Y, "Left")
-    Sleep 150
+    ; Open File > Import
+    OpenClassicImportDialog()
 
-    ; wait for the import dialog by HWND, not title
-    hwnd := FindImportDialogHwnd(15000)
+    ; Wait for classic file picker
+    hwnd := FindClassicImportFilePickerHwnd(15000)
     if !hwnd {
-        MsgBox "Import dialog not found after clicking Import."
+        MsgBox "Classic import file picker not found after File > Import."
         ExitApp 1
     }
 
@@ -277,33 +293,37 @@ ImportOneFls(flsPath) {
 
     ; Set path and confirm
     ControlSetText flsPath, "Edit1", "ahk_id " hwnd
-    Sleep 150
+    Sleep 100
     Send "{Enter}"
-    Sleep 300
 
-    ; wait for SCENE’s custom “Import results” OK
-    Sleep importResultsOkDelayMs
+    ; First make sure the file picker itself is gone
+    if !WaitForWindowGone("ahk_id " hwnd, 10000) {
+        MsgBox "Import file picker did not close for:`n" flsPath
+        ExitApp 1
+    }
 
+    ; Now optionally wait for Import Data if it appears
+    ToolTip "Importing scan..."
+    ok := WaitForImportDataIfItAppears(IMPORTDATA_MAX_SEC, IMPORTDATA_QUIET_MS, IMPORTDATA_APPEAR_GRACE_MS)
+    ToolTip
+
+    if !ok {
+        MsgBox "Import Data did not complete for:`n" flsPath
+        ExitApp 1
+    }
+
+    ; Park focus back into tree
     if useBlockInput
         BlockInput true
 
-    CoordMode "Mouse", "Screen"
-    MouseMove IMPORT_RESULTS_OK_X, IMPORT_RESULTS_OK_Y, 0
-    Sleep 50
-    Click "Left"
-    Sleep 200
-
-    ; park focus away from ribbon
     CoordMode "Mouse", "Window"
     MouseMove TREE_X, TREE_Y, 0
     Sleep 50
     Click "Left"
-    Sleep 150
+    Sleep 100
 
     if useBlockInput
         BlockInput false
-
-    Sleep waitImportMs
 }
 
 ; ---------- Optional dialog: Confirm "File already exists" -> pick "No All" ----------
@@ -346,6 +366,179 @@ IsScanModifiedDialog(hwnd) {
             return true
     }
     return false
+}
+
+; ---------- Classic Mode: open File > Import ----------
+OpenClassicImportDialog() {
+    global useBlockInput
+
+    ActivateScene()
+
+    if useBlockInput
+        BlockInput false
+
+    ; Classic menu: File > Import
+    ; Alt+f opens File menu, then i triggers Import
+    Send "!f"
+    Sleep 150
+    Send "i"
+    Sleep 150
+
+    return true
+}
+
+; ---------- Find the import file picker (not the Import Data progress dialog) ----------
+FindClassicImportFilePickerHwnd(timeoutMs := 15000) {
+    start := A_TickCount
+    Loop {
+        if (A_TickCount - start) > timeoutMs
+            return 0
+
+        list := WinGetList("ahk_class #32770")
+        for _, hwnd in list {
+            try proc := WinGetProcessName("ahk_id " hwnd)
+            catch
+                continue
+            if !(proc = "SCENE.exe" || proc = "Scene.exe")
+                continue
+
+            ; Must have Edit1 so we can paste a file path
+            if !ControlExists("Edit1", "ahk_id " hwnd)
+                continue
+
+            ; Must NOT be the Import Data progress dialog
+            title := ""
+            try title := WinGetTitle("ahk_id " hwnd)
+            catch
+                title := ""
+
+            if InStr(title, "Import Data")
+                continue
+
+            ; Strong signal: standard file picker usually has Edit1 and Button1/Button2
+            return hwnd
+        }
+        Sleep 100
+    }
+}
+
+; ---------- Import Data progress dialog detection ----------
+IsImportDataProgress(hwnd) {
+    try cls := WinGetClass("ahk_id " hwnd)
+    catch
+        return false
+    if (cls != "#32770")
+        return false
+
+    title := ""
+    try title := WinGetTitle("ahk_id " hwnd)
+    catch
+        return false
+
+    if !InStr(title, "Import Data")
+        return false
+
+    ; Look for static text and/or progress bar
+    if WindowHasStaticText(hwnd, "Import Data")
+        return true
+
+    if ControlExists("msctls_progress321", "ahk_id " hwnd)
+        return true
+    if ControlExists("msctls_progress322", "ahk_id " hwnd)
+        return true
+
+    return false
+}
+
+FindImportDataProgressHwnd() {
+    list := WinGetList("ahk_class #32770")
+    for _, hwnd in list {
+        if IsImportDataProgress(hwnd)
+            return hwnd
+    }
+    return 0
+}
+
+WaitForImportDataDone(maxSec := 7200, quietMs := 5000, mustSeeMs := 60000) {
+    start := A_TickCount
+    firstSeen := 0
+    lastSeen := 0
+
+    Loop {
+        now := A_TickCount
+        if (now - start) > (maxSec * 1000)
+            return false
+
+        hwnd := FindImportDataProgressHwnd()
+        if (hwnd) {
+            if (!firstSeen)
+                firstSeen := now
+            lastSeen := now
+            Sleep 200
+            continue
+        }
+
+        ; Don’t silently pass if we never saw it
+        if (!firstSeen) {
+            if ((now - start) > mustSeeMs)
+                return false
+            Sleep 200
+            continue
+        }
+
+        ; Seen at least once, now require quiet period
+        if ((now - lastSeen) > quietMs)
+            return true
+
+        Sleep 200
+    }
+}
+
+WaitForImportDataIfItAppears(maxSec := 7200, quietMs := 5000, appearGraceMs := 2500) {
+    ; Import Data is OPTIONAL:
+    ; - if it appears, wait for it to finish
+    ; - if it never appears within appearGraceMs, continue successfully
+
+    start := A_TickCount
+    firstSeen := 0
+    lastSeen := 0
+
+    ; Phase 1: brief grace window to see if Import Data appears at all
+    graceStart := A_TickCount
+    Loop {
+        hwnd := FindImportDataProgressHwnd()
+        if (hwnd) {
+            firstSeen := A_TickCount
+            lastSeen := firstSeen
+            break
+        }
+
+        if (A_TickCount - graceStart) > appearGraceMs {
+            ; Never appeared -> assume import was too fast / dialog flashed too briefly
+            return true
+        }
+
+        Sleep 100
+    }
+
+    ; Phase 2: it did appear, so now wait until it is gone for quietMs
+    Loop {
+        now := A_TickCount
+        if (now - start) > (maxSec * 1000)
+            return false
+
+        hwnd := FindImportDataProgressHwnd()
+        if (hwnd) {
+            lastSeen := now
+            Sleep 200
+            continue
+        }
+
+        if ((now - lastSeen) > quietMs)
+            return true
+
+        Sleep 200
+    }
 }
 
 ; ---------- Scan modified prompt (repeat) ----------
